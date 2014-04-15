@@ -5,10 +5,12 @@ __author__ = "pkolarov@gmail.com"
 
 import dbhash,anydbm
 import sys, os, shelve, logging,string
+import threading, Queue
 import flickr
 
 user = None
-
+uploaded = None
+lock = None
 
 
 #get one and only one photo for the given tags or None
@@ -47,32 +49,88 @@ def getPhotoIDbyTag(tag):
    
     return photos[0]
 
+
+class ReshelfThread (threading.Thread):
+    def __init__(self, threadID, imageDir, imageQueue, historyFile):
+        threading.Thread.__init__(self)
+        self.threadID = threadID
+        self.imageDir = imageDir 
+        self.imageQueue = imageQueue
+        self.historyFile = historyFile
+
+    def has_key(self, image):
+        global lock
+        global uploaded
+        with lock:
+            return uploaded.has_key(str(image)) 
+    
+    def update(self, image, photo):
+        global lock
+        global uploaded
+        with lock:
+            uploaded[ str(image)] = str(photo.id)
+            uploaded[ str(photo.id) ] =str(image)
+            uploaded.close();
+            uploaded = shelve.open(self.historyFile )   #its better to always reopen this file
+
+    def run(self):
+        logging.debug( "Starting ReshelfThread %d " % self.threadID )
+
+        while True:
+            try:
+                image = self.imageQueue.get_nowait()
+                logging.debug( "ReshelfThread %d qSize: %d processing %s" % (self.threadID, self.imageQueue.qsize(), image) )
+
+                image = image[len(self.imageDir):] #remove absolute directory
+                if ( not self.has_key(str(image) ) ):
+                    #each picture should have one id tag in the folder format with spaces replaced by # and starting with #
+                    flickrtag = '#' + image.replace(' ','#')
+                    logging.debug(flickrtag)
+                    photo = getPhotoIDbyTag(flickrtag)
+                    logging.debug(image)
+                    if not photo:
+                        #uploaded.close()  # flush the DB file
+                        continue
+                    logging.debug("ReshelfThread: Reregistering %s photo in local history file" % image)
+
+                    self.update(image, photo)
+            except Queue.Empty:
+                break
+        logging.debug( "Exiting ReshelfThread %d " % self.threadID )
+
+
 #store image reference in the history file if its not there yet and if we actually can
 #find it on Flickr
-def reshelf(images,  imageDir, historyFile):
+def reshelf(images,  imageDir, historyFile, numThreads):
      
-     logging.debug('flickr2history: Started flickr2history')
-     try:
-         global user
-         user = flickr.test_login()
-         logging.debug(user.id)
-     except:
-         logging.error(sys.exc_info()[0])
-         return None
-        
-     for image in images:
-        image = image[len(imageDir):] #remove absolute directory
-        uploaded = shelve.open( historyFile )   #its better to always reopen this file
-        if ( not uploaded.has_key(str(image) ) ):
-                  #each picture should have one id tag in the folder format with spaces replaced by # and starting with #
-                  flickrtag = '#' + image.replace(' ','#')
-                  photo = getPhotoIDbyTag(flickrtag)
-                  logging.debug(image)
-                  if(not photo):
-                       uploaded.close()  # flush the DB file
-                       continue
-                  logging.debug("flickr2history: Reregistering %s photo in local history file" % image)
-                  uploaded[ str(image)] = str(photo.id)
-                  uploaded[ str(photo.id) ] =str(image)
-                  uploaded.close()
-    
+    logging.debug('flickr2history: Started flickr2history')
+    try:
+        global user
+        user = flickr.test_login()
+        logging.debug(user.id)
+    except:
+        logging.error(sys.exc_info()[0])
+        return None 
+
+    imageQueue = Queue.Queue();
+    for image in images:
+        imageQueue.put_nowait(image)
+
+    global uploaded
+    uploaded = shelve.open( historyFile )   #its better to always reopen this file
+
+    global lock
+    lock = threading.Lock()
+    threads = []
+    for i in range(numThreads):
+        thread = ReshelfThread(i, imageDir, imageQueue, historyFile)
+        threads.append(thread) 
+        thread.start()
+
+    for thrd in threads:
+        thrd.join()
+
+    uploaded.close()
+
+    logging.debug('flickr2history: Finished flickr2history')
+   

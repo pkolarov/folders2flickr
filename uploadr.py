@@ -4,6 +4,7 @@ import dbhash,anydbm
 import sys, time, os, urllib2, shelve, string, logging, flickr, re
 import xmltramp, mimetools, mimetypes, md5, webbrowser, exif, flickr2history, tags2set, deleteAll
 from ConfigParser import *
+import threading, Queue
 
 #
 #   uploadr.py
@@ -52,6 +53,7 @@ FLICKR = {"title": "",
 #   File we keep the history of uploaded images in.
 #
 HISTORY_FILE = configdict.defaults()['history_file']
+NUM_THREADS = int(configdict.defaults()['num_threads'])
 
 #Kodak cam EXIF tag  keyword
 XPKEYWORDS = 'Image XPKeywords'
@@ -99,6 +101,7 @@ class Uploadr:
     TOKEN_FILE = flickr.tokenFile
 
     def __init__( self ):
+        self.lock = threading.Lock()
         self.token = self.getCachedToken()
 
 
@@ -283,9 +286,19 @@ class Uploadr:
         self.uploaded = shelve.open( HISTORY_FILE )
         newImages = self.grabNewImages()
         
+        imageQueue = Queue.Queue()
         for image in newImages:
-            self.uploadImage( image )
-        
+            imageQueue.put_nowait(image)
+
+        threads = []
+        for i in range( NUM_THREADS ):
+            thread = UploadThread(i, self, imageQueue)
+            threads.append(thread)
+            thread.start()
+    
+        for thrd in threads:
+            thrd.join()
+
 
 #get all images in folders and subfolders which match extensions below
     def grabNewImages( self ):
@@ -295,79 +308,24 @@ class Uploadr:
             (dirpath, dirnames, filenames) = data
             for f in filenames :
                 ext = f.lower().split(".")[-1]
-                if ( ext == "jpg" or ext == "gif" or ext == "png" or ext == "avi" or ext == "mov"):
+                if ext in ("jpg", "jpeg", "gif", "png", "avi", "mov", "mp4"):
                     images.append( os.path.normpath( dirpath + "/" + f ) )
         images.sort()
         return images
 
-
-    def uploadImage( self, image ):
-        folderTag = image[len(IMAGE_DIR):]
-        #print folderTag
-        #return
-        if ( not self.uploaded.has_key( folderTag ) ):
-
-            try:
-                logging.debug( "Getting EXIF for %s" % image)
-                f = open(image, 'rb')
-                exiftags = exif.process_file(f)
-                f.close()
-                #print exiftags[XPKEYWORDS]
-
-                
-                #print folderTag
-                #make one tag equal to original file path with spaces replaced by # and start it with # (for easier recognition) since space is used as TAG separator by flickr
-                # this is needed for later syncing flickr with folders 
-                realTags  = folderTag.replace('\\',' ')   # look for / or \ or _ or .  and replace them with SPACE to make real Tags 
-                realTags =  realTags.replace('/',' ')   # these will be the real tags ripped from folders
-                realTags =  realTags.replace('_',' ')
-                realTags =  realTags.replace('.',' ')  
-                picTags = '#' + folderTag.replace(' ','#') + ' ' + realTags
-
-                if exiftags == {}:
-                   logging.debug( 'NO_EXIF_HEADER for %s' % image)
-                else:
-                   if XPKEYWORDS in exiftags:  #look for additional tags in EXIF to tag picture with
-                            if len(exiftags[XPKEYWORDS].printable) > 4:
-                                picTags += exif.make_string( eval(exiftags[XPKEYWORDS].printable)).replace(';',' ')
-                
-                #print picTags
-                logging.debug( "Uploading image %s" % image)
-                photo = ('photo', image, open(image,'rb').read())
-
-
-                d = {
-                    api.token   : str(self.token),
-                    api.perms   : str(self.perms),
-                    "tags"      : str(picTags),
-                    "is_public" : str( FLICKR["is_public"] ),
-                    "is_friend" : str( FLICKR["is_friend"] ),
-                    "is_family" : str( FLICKR["is_family"] )
-                }
-                sig = self.signCall( d )
-                d[ api.sig ] = sig
-                d[ api.key ] = FLICKR[ api.key ]
-                url = self.build_request(api.upload, d, (photo,))
-                xml = urllib2.urlopen( url ).read()
-                res = xmltramp.parse(xml)
-                if ( self.isGood( res ) ):
-                    logging.debug( "successful.")
-                    self.logUpload( res.photoid, folderTag )
-                else :
-                    print "problem.."
-                    self.reportError( res )
-            except:
-                logging.error(sys.exc_info())
-
+    def has_key(self, folderTag):
+        with self.lock:
+            return self.uploaded.has_key(folderTag)
 
     def logUpload( self, photoID, imageName ):
         
         photoID = str( photoID )
         imageName = str( imageName )
-        self.uploaded[ imageName ] = photoID
-        self.uploaded[ photoID ] = imageName
-        self.uploaded.close()
-        self.uploaded = shelve.open( HISTORY_FILE )
+        with self.lock:
+            self.uploaded[ imageName ] = photoID
+            self.uploaded[ photoID ] = imageName
+            self.uploaded.close()
+            self.uploaded = shelve.open( HISTORY_FILE )
 
     #
     #
@@ -439,6 +397,81 @@ class Uploadr:
         xml = urllib2.urlopen( url ).read()
         return xmltramp.parse( xml )
 
+class UploadThread (threading.Thread):
+    def __init__(self, threadID, upl, imageQueue):
+        threading.Thread.__init__(self)
+        self.threadID = threadID
+        self.upl = upl
+        self.imageQueue = imageQueue
+
+    def uploadImage( self, image ):
+        folderTag = image[len(IMAGE_DIR):]
+
+        if ( not self.upl.has_key( folderTag ) ):
+
+            try:
+                logging.debug( "UploadThread %d Getting EXIF for %s" % (self.threadID, image))
+                f = open(image, 'rb')
+                exiftags = exif.process_file(f)
+                f.close()
+                #print exiftags[XPKEYWORDS]
+
+                
+                #print folderTag
+                #make one tag equal to original file path with spaces replaced by # and start it with # (for easier recognition) since space is used as TAG separator by flickr
+                # this is needed for later syncing flickr with folders 
+                realTags  = folderTag.replace('\\',' ')   # look for / or \ or _ or .  and replace them with SPACE to make real Tags 
+                realTags =  realTags.replace('/',' ')   # these will be the real tags ripped from folders
+                realTags =  realTags.replace('_',' ')
+                realTags =  realTags.replace('.',' ')  
+                picTags = '#' + folderTag.replace(' ','#') + ' ' + realTags
+
+                if exiftags == {}:
+                    logging.debug( 'UploadThread %d NO_EXIF_HEADER for %s' % (self.threadID, image))
+                else:
+                    if XPKEYWORDS in exiftags:  #look for additional tags in EXIF to tag picture with
+                            if len(exiftags[XPKEYWORDS].printable) > 4:
+                                picTags += exif.make_string( eval(exiftags[XPKEYWORDS].printable)).replace(';',' ')
+                
+                #print picTags
+                logging.debug( "UploadThread %d Uploading image %s" % (self.threadID, image))
+                photo = ('photo', image, open(image,'rb').read())
+
+
+                d = {
+                    api.token   : str(self.upl.token),
+                    api.perms   : str(self.upl.perms),
+                    "tags"      : str(picTags),
+                    "is_public" : str( FLICKR["is_public"] ),
+                    "is_friend" : str( FLICKR["is_friend"] ),
+                    "is_family" : str( FLICKR["is_family"] )
+                }
+                sig = self.upl.signCall( d )
+                d[ api.sig ] = sig
+                d[ api.key ] = FLICKR[ api.key ]
+                url = self.upl.build_request(api.upload, d, (photo,))
+                xml = urllib2.urlopen( url ).read()
+                res = xmltramp.parse(xml)
+                if ( self.upl.isGood( res ) ):
+                    logging.debug( "successful.")
+                    self.upl.logUpload( res.photoid, folderTag )
+                else :
+                    print "problem.."
+                    self.upl.reportError( res )
+            except:
+                logging.error(sys.exc_info())
+
+    def run(self):
+        logging.debug("Starting UploadThread %d " % self.threadID)
+
+        while True:
+            try:
+                image = self.imageQueue.get_nowait()
+                logging.debug("UploadThread %d qSize: %d processing %s" % (self.threadID, self.imageQueue.qsize(), image))
+                self.uploadImage(image)
+            except Queue.Empty:
+                break
+        logging.debug("Exiting UploadThread %d " % self.threadID)
 
 
 if __name__ == "__main__":
@@ -464,7 +497,7 @@ if __name__ == "__main__":
         images = flickr.grabNewImages()
         #this is just double checking if everything is on Flickr what is in the history file
 	# in another words it will restore history file if deleted by comparing flickr with folders
-        flickr2history.reshelf(images, IMAGE_DIR, HISTORY_FILE)
+        flickr2history.reshelf(images, IMAGE_DIR, HISTORY_FILE, NUM_THREADS)
 
 	#uploads all images that are in folders and not in history file        
         flickr.upload()  #uploads all new images to flickr
